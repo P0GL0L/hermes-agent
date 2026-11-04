@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from collections import Counter
+import weakref
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -24,7 +24,8 @@ from gateway.hosted_room_peer import (
     GatewayRoomCatalog, HostedMemberDispatch, PROTOCOL_VERSION, room_grant_needs_dispatch_refresh)
 from tui_gateway import hosted_room_prepare_stall as prepare_stall
 from tui_gateway.hosted_room_driver import HostedRoomBinding, HostedRoomRuntime
-from tui_gateway.hosted_room_member_activity import forget_task_progress, record_task_progress, task_progress
+from tui_gateway.hosted_room_member_activity import (
+    current_tools, forget_task_progress, record_task_progress, task_progress)
 from tui_gateway.hosted_room_server_rpc import HostedRoomServerRPC
 from tui_gateway.hosted_room_peer_http import (
     PeerRunsHTTPClient, PeerRunsHTTPError, digest_reauthorization_error)
@@ -113,6 +114,22 @@ def _authority(room: Mapping[str, Any]) -> tuple[str, int]:
     return str(room["authority_gateway_id"]), int(room["authority_epoch"])
 
 
+# Every room service this process built (the standalone one and each gateway authority's): the change
+# watcher reads their live status from here instead of knowing how runners hold authorities.
+_live_services: weakref.WeakSet = weakref.WeakSet()
+
+
+_live_services_lock = threading.Lock()
+
+
+def live_room_services() -> list:
+    # A WeakSet changes size when a service is built (another thread hot-serving a profile) or collected;
+    # copying under the lock that guards add() is safe against the first, and WeakSet defers removals
+    # while it is being iterated, which covers the second.
+    with _live_services_lock:
+        return list(_live_services)
+
+
 class HostedRoomService:
     """Own the hosted Discussion policy and its transport-free worker."""
 
@@ -152,6 +169,8 @@ class HostedRoomService:
             poll_interval_seconds=_HOSTED_ROOM_IDLE_FALLBACK_SECONDS,
             active_poll_interval_seconds=_HOSTED_ROOM_ACTIVE_POLL_SECONDS,
             turn_timeout_seconds=_hosted_room_turn_timeout_seconds())
+        with _live_services_lock:
+            _live_services.add(self)
 
     def _make_rpc(self, server):
         return HostedRoomServerRPC(server, db_path=self.db_path)
@@ -679,14 +698,36 @@ class HostedRoomService:
         self.runtime.wakeup()
         return result
 
+    def live_status_sig(self) -> dict[str, tuple]:
+        """Per room, the parts of ``status(room_id)`` that only this process holds (no store write follows
+        them): pending approvals, peer route states, the tool each running member is in, a stalled
+        preparation, a blocked room, and whether the worker runs. Cheap: memory only, no task reads."""
+        runtime = self.runtime.status()
+        rooms: dict[str, list] = {}
+        with self._policy_lock:
+            for (room_id, member_id), action in self._pending_actions.items():
+                rooms.setdefault(room_id, []).append(("action", member_id, repr(sorted(action.items()))))
+            for (room_id, member_id), route_status in self._peer_route_status.items():
+                rooms.setdefault(room_id, []).append(("route", member_id, route_status))
+        for room_id in runtime["blocked_rooms"]:
+            rooms.setdefault(room_id, []).append(("blocked",))
+        for room_id in self._prepare_stalls.stalled_rooms():
+            rooms.setdefault(room_id, []).append(("stalled",))
+        for room_id, task_id, tool in current_tools():
+            rooms.setdefault(room_id, []).append(("tool", task_id, tool))
+        running = bool(runtime["running"]) and not runtime["stopping"]
+        return {room_id: (running, *sorted(rows)) for room_id, rows in rooms.items()} | {"": (running,)}
+
     def status(self, room_id: str | None = None) -> dict[str, Any]:
-        runtime = {**self.runtime.status(), "peer_routes": self._route_statuses(room_id)}
+        routes = self._route_statuses(room_id)
+        runtime = {**self.runtime.status(), "peer_routes": routes}
         if self._link_load_error:
             runtime["link_load_error"] = self._link_load_error
         if room_id is None:
             return runtime
-        tasks = driver.list_tasks(self.db_path, room_id=room_id)
-        counts = Counter(str(task["status"]) for task in tasks)
+        # Retained terminal tasks (up to thousands) are only counted; only the rows shown here are decoded.
+        counts, tasks = driver.room_task_summary(
+            self.db_path, room_id=room_id, statuses=(*_LIVE_STATUSES, *_RETRYABLE_STATUSES))
         pending_actions = [
             attempt_action("retry", task) for task in tasks if task["status"] in _RETRYABLE_STATUSES]
         if self._prepare_stalls.stalled(room_id):
@@ -706,7 +747,7 @@ class HostedRoomService:
             "member_activity": member_activity,
             "last_error": self._prepare_stalls.last_error(room_id),
             "max_rounds": self.discussion_limits.max_rounds,
-            "peer_routes": self._route_statuses(room_id)}
+            "peer_routes": routes}
 
 
 class _RouteStatusPeerClient:

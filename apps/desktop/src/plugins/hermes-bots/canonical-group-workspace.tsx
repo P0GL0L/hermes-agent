@@ -21,17 +21,26 @@ import { fill, ROOM_COMPOSER_INPUT_CLASS, RoomComposer, RoomReplyChip } from './
 type RoomEvent = CanonicalGroupEvent
 interface Attachment { attachment_id?: string; event_id?: string; kind: string; name: string; mime: string; size?: number }
 interface RoomReply { member?: CanonicalRoomMember; name: string; quote: string; thread?: string }
-interface RoomState { room: CanonicalRoom; context?: CanonicalRoomContext | null; driver_status?: CanonicalDriverActivity & { pending_actions?: CanonicalPendingAction[] } }
+interface RoomState { room: CanonicalRoom & { latest_seq?: number }; context?: CanonicalRoomContext | null; driver_status?: CanonicalDriverActivity & { pending_actions?: CanonicalPendingAction[] }; change_events?: boolean }
 
 const sameGroupPayload = (payload: Record<string, unknown>, text: string, attachments: Attachment[], thread?: string) =>
   payload.text === text && JSON.stringify(payload.attachments ?? []) === JSON.stringify(attachments) &&
   // Preparing mints a thread for a new conversation, so only a reply's thread must match.
   (thread === undefined || payload.thread_id === thread)
 
-/** The durable log only grows: an unchanged length and last seq is the same log, so keep its identity
- *  and the derived history (handoffs, outcomes) is not recomputed on every poll. */
-const sameLog = (current: readonly { seq: number }[], next: readonly { seq: number }[]) =>
-  current.length === next.length && current.at(-1)?.seq === next.at(-1)?.seq
+// A backend that broadcasts groups.changed (groups.state says change_events) moves the view on push; the
+// poll is then only a backstop for a lost signal. Older backends keep the 2 s poll.
+const ROOM_POLL_MS = 2000
+const ROOM_BACKSTOP_MS = 15_000
+
+/** Extend `log` with one groups.log page read after `cursor`. The log is append-only with one seq per
+ *  event, so a page applies only from cursor+1 on: an event the view already holds is skipped, and a page
+ *  that would leave a hole is refused, so the view is always a prefix of the room log. */
+export function appendRoomLogPage<T extends { seq: number }>(log: readonly T[], cursor: number, page: readonly T[]): null | T[] {
+  const fresh = page.filter(event => event.seq > cursor)
+
+  return fresh.every((event, index) => event.seq === cursor + index + 1) ? [...log, ...fresh] : null
+}
 
 const canSendNow = (gate: { restored: boolean; busy: boolean; uploading: boolean; pending: boolean; draft: string; attachments: number; driver: boolean }) =>
   gate.restored && !gate.busy && !gate.uploading && gate.driver && (gate.pending || !!gate.draft.trim() || gate.attachments > 0)
@@ -91,26 +100,37 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
     return () => { cancelled = true; alive.current = false; revision.current++ }
   }, [binding])
 
+  // The applied log, read only after its last seq (the cursor): a refresh asks for what is new, not the whole room.
+  const applied = useRef<RoomEvent[]>([])
+  const changeEvents = useRef(false)
+
   const refresh = async () => {
     const version = ++revision.current
     const snapshot = await canonicalGroupRequest<RoomState>(binding, 'groups.state', { room_id: binding.roomId })
-    const log: RoomEvent[] = []
-    let cursor = 0
+    const base = applied.current
+    // A log shorter than the view was replaced under it (a room re-hosted onto another store): rebuild.
+    let log = (snapshot.room.latest_seq ?? Infinity) < (base.at(-1)?.seq ?? 0) ? [] : base
 
     for (;;) {
-      const page = await canonicalGroupRequest<{ events: RoomEvent[]; has_more?: boolean; next_seq?: number }>(binding, 'groups.log', { room_id: binding.roomId, since_seq: cursor, limit: 100 })
-      log.push(...page.events)
+      const cursor = log.at(-1)?.seq ?? 0
+      const page = await canonicalGroupRequest<{ events: RoomEvent[]; has_more?: boolean }>(binding, 'groups.log', { room_id: binding.roomId, since_seq: cursor, limit: 100 })
+      const next = appendRoomLogPage(log, cursor, page.events)
+
+      if (!next) {throw new Error(labels.invalidLogCursor)}
+      const advanced = next.length > log.length
+      log = advanced ? next : log
 
       if (!page.has_more) {break}
-      const next = page.events.at(-1)?.seq
 
-      if (!next || next <= cursor) {throw new Error(labels.invalidLogCursor)}
-      cursor = next
+      if (!advanced) {throw new Error(labels.invalidLogCursor)}
     }
 
     if (alive.current && version === revision.current) {
+      // An unchanged log keeps its identity, so the derived history (handoffs, outcomes) is not recomputed.
+      applied.current = log
+      changeEvents.current = snapshot.change_events === true
       setState(snapshot)
-      setEvents(current => sameLog(current, log) ? current : log)
+      setEvents(log)
       setReadError('')
     }
   }
@@ -118,17 +138,48 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   useEffect(() => {
     if (!visible) {return}
     let cancelled = false
-    let timer: ReturnType<typeof setTimeout>
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let running = false
+    let again = false
 
+    // One read at a time; a signal that lands mid-read runs one more after it, so none is lost.
     const poll = async () => {
-      try { await refresh() } catch (e) { if (!cancelled) {setReadError(String(e instanceof Error ? e.message : e))} }
+      if (running) {
+        again = true
 
-      if (!cancelled) {timer = setTimeout(() => void poll(), 2000)}
+        return
+      }
+
+
+      running = true
+      clearTimeout(timer)
+
+      do {
+        again = false
+
+        try { await refresh() } catch (e) { if (!cancelled) {setReadError(String(e instanceof Error ? e.message : e))} }
+      } while (again && !cancelled)
+
+      running = false
+
+      if (!cancelled) {timer = setTimeout(() => void poll(), changeEvents.current ? ROOM_BACKSTOP_MS : ROOM_POLL_MS)}
     }
+
+    // An untagged event may come from any route (the local/legacy primary), so it refreshes too; one
+    // naming rooms refreshes only their views (no list: something process-wide moved).
+    const unsubscribe = typeof host.onEvent === 'function'
+      ? host.onEvent('groups.changed', event => {
+        const { connectionId, payload } = event as { connectionId?: string; payload?: { room_ids?: unknown } }
+        const source = String(connectionId || '')
+        const rooms = Array.isArray(payload?.room_ids) ? payload.room_ids : null
+
+        if (!cancelled && (!source || source === binding.connectionId) && (!rooms || rooms.includes(binding.roomId))) {void poll()}
+      })
+      : undefined
 
     void poll()
 
-    return () => { cancelled = true; revision.current++; clearTimeout(timer) }
+    return () => { cancelled = true; revision.current++; clearTimeout(timer); unsubscribe?.() }
     // The keyed parent freezes the authority binding for this lifetime.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible])
