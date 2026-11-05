@@ -142,6 +142,7 @@ class HostedRoomService:
         hosted_rooms.prune_disbanded_rooms(self.db_path)
         self._policy_lock = threading.RLock()
         self._pending_actions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._last_live_sig: dict[str, tuple] = {}
         self.policy_checkpoint = HostedRoomPolicyCheckpoint(
             self.db_path,
             max_active_events=1 + 2 * discussion.MAX_DISCUSSION_MEMBERS * self.discussion_limits.max_rounds)
@@ -698,17 +699,33 @@ class HostedRoomService:
         self.runtime.wakeup()
         return result
 
+    def _attempt_actions(self, room_id: str, tasks_shown: list[dict[str, Any]]) -> tuple[list, list]:
+        """The per-attempt actions ``status`` offers for the live/retryable rows it read, as (before, after)
+        the stall and approval cards: here a Retry per retryable attempt, first."""
+        return [attempt_action("retry", task) for task in tasks_shown if task["status"] in _RETRYABLE_STATUSES], []
+
     def live_status_sig(self) -> dict[str, tuple]:
         """Per room, the parts of ``status(room_id)`` that only this process holds (no store write follows
         them): pending approvals, peer route states, the tool each running member is in, a stalled
         preparation, a blocked room, and whether the worker runs. Cheap: memory only, no task reads."""
         runtime = self.runtime.status()
         rooms: dict[str, list] = {}
-        with self._policy_lock:
-            for (room_id, member_id), action in self._pending_actions.items():
-                rooms.setdefault(room_id, []).append(("action", member_id, repr(sorted(action.items()))))
-            for (room_id, member_id), route_status in self._peer_route_status.items():
-                rooms.setdefault(room_id, []).append(("route", member_id, route_status))
+        # Never wait for _policy_lock here: prepare_room/stop_room hold it across store writes and peer
+        # calls, and this runs on the one watcher thread every push shares. Copy the two dicts unlocked
+        # (each value is replaced whole, never mutated); a copy racing a writer retries, then reuses the
+        # last answer, which the next pass corrects.
+        for _attempt in range(3):
+            try:
+                actions, routes = list(self._pending_actions.items()), list(self._peer_route_status.items())
+                break
+            except RuntimeError:  # dictionary changed size during iteration
+                continue
+        else:
+            return self._last_live_sig
+        for (room_id, member_id), action in actions:
+            rooms.setdefault(room_id, []).append(("action", member_id, repr(sorted(action.items()))))
+        for (room_id, member_id), route_status in routes:
+            rooms.setdefault(room_id, []).append(("route", member_id, route_status))
         for room_id in runtime["blocked_rooms"]:
             rooms.setdefault(room_id, []).append(("blocked",))
         for room_id in self._prepare_stalls.stalled_rooms():
@@ -716,7 +733,8 @@ class HostedRoomService:
         for room_id, task_id, tool in current_tools():
             rooms.setdefault(room_id, []).append(("tool", task_id, tool))
         running = bool(runtime["running"]) and not runtime["stopping"]
-        return {room_id: (running, *sorted(rows)) for room_id, rows in rooms.items()} | {"": (running,)}
+        self._last_live_sig = {room_id: (running, *sorted(rows)) for room_id, rows in rooms.items()} | {"": (running,)}
+        return self._last_live_sig
 
     def status(self, room_id: str | None = None) -> dict[str, Any]:
         routes = self._route_statuses(room_id)
@@ -728,14 +746,14 @@ class HostedRoomService:
         # Retained terminal tasks (up to thousands) are only counted; only the rows shown here are decoded.
         counts, tasks = driver.room_task_summary(
             self.db_path, room_id=room_id, statuses=(*_LIVE_STATUSES, *_RETRYABLE_STATUSES))
-        pending_actions = [
-            attempt_action("retry", task) for task in tasks if task["status"] in _RETRYABLE_STATUSES]
+        pending_actions, trailing_actions = self._attempt_actions(room_id, tasks)
         if self._prepare_stalls.stalled(room_id):
             pending_actions.append(prepare_stall.retry_action(room_id, self._room(room_id)))
         with self._policy_lock:
             pending_actions.extend(
                 dict(action) for (action_room_id, _member_id), action
                 in self._pending_actions.items() if action_room_id == room_id)
+        pending_actions.extend(trailing_actions)
         # Who is answering right now, since when, and (when this process runs the turn) in which tool.
         member_activity = [
             _member_activity(task) for task in tasks if task["status"] in _LIVE_STATUSES]

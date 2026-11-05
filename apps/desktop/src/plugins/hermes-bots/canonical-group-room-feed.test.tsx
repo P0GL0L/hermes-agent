@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { atom } from 'nanostores'
 import type { ComponentProps } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
@@ -183,4 +183,43 @@ it('rebuilds from the start when the room log is shorter than the view (re-hoste
   await screen.findByText('fresh-1')
   expect(screen.queryByText('m3')).toBeNull()
   expect(logReads().at(-1)).toBe(0)
+})
+
+
+it('runs one room read at a time for every caller: Refresh joins a push read in flight', async () => {
+  const room = { log: [message(1)], changeEvents: true }
+  serveRoom(room)
+  const serve = request.getMockImplementation()!
+  let failLog = true
+  request.mockImplementation(async (...args: Parameters<typeof serve>) =>
+    args[1] === 'groups.log' && failLog ? Promise.reject(new Error('busy store')) : serve(...args))
+  render(<CanonicalGroupWorkspace binding={binding} />)
+  const retry = await screen.findByRole('button', { name: 'Refresh' })  // the read-error banner's button
+
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  let inFlight = 0
+  let maxInFlight = 0
+  failLog = false
+  request.mockImplementation(async (...args: Parameters<typeof serve>) => {
+    if (args[1] !== 'groups.state') {return serve(...args)}
+    inFlight++
+    maxInFlight = Math.max(maxInFlight, inFlight)
+
+    try { await held
+
+      return await serve(...args) } finally { inFlight-- }
+  })
+  room.log.push(message(2))
+  emit('groups.changed', { connectionId: 'local' })   // a push read starts and is held
+  fireEvent.click(retry)                              // the user's Refresh lands mid-read
+  await act(async () => { release() })
+  await screen.findByText('m2')
+  expect(maxInFlight).toBe(1)
+})
+
+it('keeps the same array when a read brings nothing new', () => {
+  const log = [message(1), message(2)]
+  expect(appendRoomLogPage(log, 2, [])).toBe(log)
+  expect(appendRoomLogPage(log, 2, [message(1), message(2)])).toBe(log)
 })

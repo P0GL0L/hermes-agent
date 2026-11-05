@@ -36,10 +36,13 @@ const ROOM_BACKSTOP_MS = 15_000
 /** Extend `log` with one groups.log page read after `cursor`. The log is append-only with one seq per
  *  event, so a page applies only from cursor+1 on: an event the view already holds is skipped, and a page
  *  that would leave a hole is refused, so the view is always a prefix of the room log. */
-export function appendRoomLogPage<T extends { seq: number }>(log: readonly T[], cursor: number, page: readonly T[]): null | T[] {
+export function appendRoomLogPage<T extends { seq: number }>(log: readonly T[], cursor: number, page: readonly T[]): null | readonly T[] {
   const fresh = page.filter(event => event.seq > cursor)
 
-  return fresh.every((event, index) => event.seq === cursor + index + 1) ? [...log, ...fresh] : null
+  if (!fresh.every((event, index) => event.seq === cursor + index + 1)) {return null}
+
+  // Nothing new keeps the same array: status-only pushes and backstop polls allocate nothing per event.
+  return fresh.length ? [...log, ...fresh] : log
 }
 
 const canSendNow = (gate: { restored: boolean; busy: boolean; uploading: boolean; pending: boolean; draft: string; attachments: number; driver: boolean }) =>
@@ -104,26 +107,63 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   const applied = useRef<RoomEvent[]>([])
   const changeEvents = useRef(false)
 
-  const refresh = async () => {
+  // One room read at a time for every caller (poll, push, a mutation's settle, Refresh, settings saved): a
+  // call landing mid-read waits for it and runs one more after it, so none is lost and no two overlap.
+  const reading = useRef<{ current: Promise<void>; again: boolean } | null>(null)
+
+  const refresh = (): Promise<void> => {
+    const flight = reading.current
+
+    if (flight) {
+      flight.again = true
+
+      return flight.current
+    }
+
+    const next = { current: Promise.resolve(), again: false }
+    next.current = (async () => {
+      try {
+        do {
+          next.again = false
+          await readRoom()
+        } while (next.again && alive.current)
+      } finally {
+        reading.current = null
+      }
+    })()
+    reading.current = next
+
+    return next.current
+  }
+
+  const readRoom = async () => {
     const version = ++revision.current
     const snapshot = await canonicalGroupRequest<RoomState>(binding, 'groups.state', { room_id: binding.roomId })
     const base = applied.current
     // A log shorter than the view was replaced under it (a room re-hosted onto another store): rebuild.
     let log = (snapshot.room.latest_seq ?? Infinity) < (base.at(-1)?.seq ?? 0) ? [] : base
 
-    for (;;) {
-      const cursor = log.at(-1)?.seq ?? 0
-      const page = await canonicalGroupRequest<{ events: RoomEvent[]; has_more?: boolean }>(binding, 'groups.log', { room_id: binding.roomId, since_seq: cursor, limit: 100 })
-      const next = appendRoomLogPage(log, cursor, page.events)
+    // Validated pages are collected and joined onto the prefix once, not recopied per page.
+    const pages: RoomEvent[][] = []
+    let cursor = log.at(-1)?.seq ?? 0
 
-      if (!next) {throw new Error(labels.invalidLogCursor)}
-      const advanced = next.length > log.length
-      log = advanced ? next : log
+    for (;;) {
+      const page = await canonicalGroupRequest<{ events: RoomEvent[]; has_more?: boolean }>(binding, 'groups.log', { room_id: binding.roomId, since_seq: cursor, limit: 100 })
+      const fresh = appendRoomLogPage([], cursor, page.events)
+
+      if (!fresh) {throw new Error(labels.invalidLogCursor)}
+
+      if (fresh.length) {
+        pages.push(fresh as RoomEvent[])
+        cursor = fresh[fresh.length - 1].seq
+      }
 
       if (!page.has_more) {break}
 
-      if (!advanced) {throw new Error(labels.invalidLogCursor)}
+      if (!fresh.length) {throw new Error(labels.invalidLogCursor)}
     }
+
+    log = pages.length ? log.concat(...pages) : log
 
     if (alive.current && version === revision.current) {
       // An unchanged log keeps its identity, so the derived history (handoffs, outcomes) is not recomputed.
@@ -139,30 +179,17 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
     if (!visible) {return}
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | undefined
-    let running = false
-    let again = false
 
-    // One read at a time; a signal that lands mid-read runs one more after it, so none is lost.
+    // refresh() owns the one-read-at-a-time rule; the poll only reschedules itself after each read.
     const poll = async () => {
-      if (running) {
-        again = true
-
-        return
-      }
-
-
-      running = true
       clearTimeout(timer)
 
-      do {
-        again = false
+      try { await refresh() } catch (e) { if (!cancelled) {setReadError(String(e instanceof Error ? e.message : e))} }
 
-        try { await refresh() } catch (e) { if (!cancelled) {setReadError(String(e instanceof Error ? e.message : e))} }
-      } while (again && !cancelled)
-
-      running = false
-
-      if (!cancelled) {timer = setTimeout(() => void poll(), changeEvents.current ? ROOM_BACKSTOP_MS : ROOM_POLL_MS)}
+      if (!cancelled) {
+        clearTimeout(timer)
+        timer = setTimeout(() => void poll(), changeEvents.current ? ROOM_BACKSTOP_MS : ROOM_POLL_MS)
+      }
     }
 
     // An untagged event may come from any route (the local/legacy primary), so it refreshes too; one

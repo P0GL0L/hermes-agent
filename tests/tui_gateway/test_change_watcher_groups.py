@@ -190,3 +190,33 @@ def test_a_failing_driver_wake_does_not_end_the_watcher_thread(monkeypatch):
     with pytest.raises(SystemExit):
         started[0]()
     assert len(passes) == 3
+
+
+def test_live_status_never_waits_for_the_policy_lock(tmp_path):
+    """prepare_room/stop_room hold _policy_lock across store writes (10 s busy timeout) and peer calls; the
+    watcher thread every push shares must read live status without waiting for it."""
+    db = tmp_path / "state.db"
+    rooms.create_room(db, room_id="room-1", name="Room", members=[{"profile": "ops", "handle": "ops"}],
+                      authority_gateway_id="gateway-a", now=10)
+    service = hosted_room_service.HostedRoomService(
+        SimpleNamespace(_methods={}, _sessions={}, _sessions_lock=threading.Lock()), db_path=db)
+    service._set_pending_action("room-1", "ops", {"kind": "approval", "task_id": "t1", "request_id": "r1"})
+    held, done, result = threading.Event(), threading.Event(), {}
+
+    def hold():
+        with service._policy_lock:
+            held.set()
+            done.wait(5)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    held.wait(5)
+    reader = threading.Thread(target=lambda: result.setdefault("sig", service.live_status_sig()), daemon=True)
+    reader.start()
+    reader.join(1.0)
+    waited = reader.is_alive()  # read while the lock is still held
+    done.set()
+    holder.join(5)
+    reader.join(5)
+    assert not waited, "live_status_sig waited on _policy_lock"
+    assert any(row[0] == "action" for row in result["sig"]["room-1"][1:])
