@@ -222,8 +222,7 @@ def _db_content_sig(db_path: Path, cache: dict, read, *, keep_on_error=lambda si
         from hermes_state_holders import read_only_db_uri
         conn = _connect_tracked_db(read_only_db_uri(db_path), tracking_path=db_path, uri=True, timeout=0.05)
         signature = read(conn, mtime)
-    # As main's sessions digest: an untrackable connection or a missing helper falls back like a busy read.
-    except Exception:  # health: allow BLE001 -- see above
+    except Exception:  # health: allow BLE001 -- as main's sessions digest: any failed read falls back like a busy one
         if cached is not None and cached[1] is not None and keep_on_error(cached[1]):
             return cached[1]
         signature = fallback(mtime)
